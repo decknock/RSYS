@@ -1,0 +1,951 @@
+#include "../NoEdit/ProcessorMulti_Processor_Core_PrivFunc.h"
+#include <cmath>
+#include <algorithm>
+#include <numeric>
+#include <cstddef>
+#include <cstring>
+#include <fstream>
+#include <ios>
+#include <iostream>
+#include <vector>
+
+//*******************Please add static libraries in .pro file*******************
+//e.g. unix:LIBS += ... or win32:LIBS += ...
+
+// 三角函数表
+static int sin_table[361];
+static int cos_table[361];
+// static double sin_table_2[361];
+// static double cos_table_2[361];
+const double PI = 3.141592653589;
+const double scale_factor = PI / 360.0;   // 比例因子
+const double scale_factor_2 = 360.0 / PI; // 比例因子
+int exp_times = 0;                        // 实验次数
+
+#define user_path "/home/rsys/Desktop/DATA/%1"
+#define exp_times_path "" // QString(user_path).arg("exp_times.txt").toStdString().c_str()
+#define file(name) QString("/home/rsys/Desktop/DATA/%1%2.csv").arg(name).arg(file_num).toStdString().c_str()
+
+struct init_helper
+{
+    init_helper()
+    {
+        std::ifstream ifs(exp_times_path);
+        if (ifs.good())
+            ifs >> exp_times;
+        else
+            exp_times = 0;
+
+        exp_times++;
+
+        std::ofstream ofs(exp_times_path);
+        ofs << exp_times;
+
+        for (std::size_t i = 0; i <= 360; i++)
+        {
+            sin_table[i] = std::sin(i * scale_factor) * 256; // 1 << 8
+            cos_table[i] = std::cos(i * scale_factor) * 256;
+        }
+    }
+} helper;
+
+struct imu_data_type
+{
+    double orientation;
+    int odometry;
+    int timestamp;
+    imu_data_type(double _ori, int _odometry, int _timestamp)
+    {
+        orientation = _ori;
+        odometry = _odometry;
+        timestamp = _timestamp;
+    }
+};
+
+struct point_type
+{
+    // x、y 的单位是激光距离单位 * 1 << 8
+    int x;
+    int y;
+    point_type() {}
+    point_type(int _x, int _y)
+    {
+        x = _x;
+        y = _y;
+    }
+};
+
+struct line_type
+{
+    // theta 的单位是 0.5 degree. 范围是 [0, 360)
+    int theta;
+    // r 的单位是激光距离单位. 范围是 [-200, 200]
+    int r;
+    int weight;
+    line_type() {}
+    line_type(int _theta, int _r, int _weight)
+    {
+        theta = _theta;
+        r = _r;
+        weight = _weight;
+    }
+};
+
+struct output_type
+{
+    int steer, speed;
+    output_type(int _steer, int _speed)
+    {
+        steer = _steer;
+        speed = _speed;
+    }
+};
+
+template <typename T> T clamp(T x, T down, T up)
+{
+    if (x > up)
+        return up;
+    if (x < down)
+        return down;
+    return x;
+}
+
+//std::ostream &qDebug() { return std::cout; }
+extern int qRound(double);
+
+int if_in_turn = 0;
+int if_in_circle = 0;
+int Turn_cnt = 0;
+int Circle_cnt = 0;
+
+bool need_init = true;
+
+int last_steer = 0;
+int last_speed = 0;
+double last_orientation = 0;
+
+double last_heading;
+double last_odometry;
+
+int hough_matrix[360][401];
+point_type laser_points[361];
+
+static int fast_sin(int angle) { return sin_table[angle]; }
+static int fast_cos(int angle) { return cos_table[angle]; }
+
+static int point_distance_sqr(int p1_x, int p1_y, int p2_x, int p2_y)
+{
+    return std::pow(p1_x - p2_x, 2) + std::pow(p1_y - p2_y, 2);
+}
+
+// 聚类，菜狗算法
+std::vector<line_type> line_cluster(const std::vector<line_type> &lines)
+{
+    std::size_t n_lines = lines.size();
+    std::vector<unsigned char> bool_vec(n_lines, true);
+    std::vector<std::vector<line_type> > groups;
+    for (std::size_t i = 0; i < n_lines; i++)
+    {
+        line_type line_i = lines[i];
+        if (bool_vec[i])
+        {
+            groups.push_back(std::vector<line_type>(1, line_i));
+            bool_vec[i] = false;
+            for (std::size_t j = i + 1; j < n_lines; j++)
+            {
+                line_type line_j = lines[j];
+                if (bool_vec[j] &&
+                    point_distance_sqr(line_i.theta, line_i.r, line_j.theta,
+                                       line_j.r) <= 900) // th
+                {
+                    bool_vec[j] = false;
+                    groups.back().push_back(line_j);
+                }
+            }
+        }
+    }
+
+    std::size_t n_groups = groups.size();
+
+    std::vector<line_type> possible_return_value;
+    for (std::size_t i = 0; i < n_groups; i++)
+    {
+        std::size_t group_size = groups[i].size();
+        int avg_theta = 0, avg_r = 0, sum_weight = 0;
+        for (std::size_t j = 0; j < group_size; j++)
+        {
+            avg_theta += groups[i][j].theta * groups[i][j].weight;
+            avg_r += groups[i][j].r * groups[i][j].weight;
+            sum_weight += groups[i][j].weight;
+        }
+        avg_theta /= sum_weight;
+        avg_r /= sum_weight;
+        possible_return_value.push_back(line_type(avg_theta, avg_r, sum_weight));
+    }
+
+    return possible_return_value;
+}
+
+// Hough 变换专用
+void do_hough(int x, int y)
+{
+    for (std::size_t alpha = 0; alpha < 360; alpha++)
+    {
+        int r = (x * fast_sin(alpha) - y * fast_cos(alpha)) >> 16;
+        if (r >= -200 && r <= 200)
+            hough_matrix[alpha][r + 200]++;
+    }
+}
+
+int num_distance(int a, int b) { return std::abs(a - b); }
+
+void get_laser_points(const short *lidar_data, std::size_t start_angle,
+                      std::size_t end_angle)
+{
+    for (std::size_t i = start_angle; i <= end_angle; i++)
+    {
+        laser_points[i] =
+            point_type(lidar_data[i] * fast_cos(i), lidar_data[i] * fast_sin(i));
+    }
+}
+
+std::vector<line_type> find_lines(const short *lidar_data, std::size_t start_angle = 0,
+                                  std::size_t end_angle = 360)
+{
+
+    std::memset(hough_matrix, 0, sizeof(hough_matrix));
+
+    get_laser_points(lidar_data, start_angle, end_angle);
+    // 对于激光点，构建 Hough 变换矩阵
+    for (std::size_t i = start_angle; i <= end_angle; i++)
+    {
+        if (laser_points[i].x != 0 && laser_points[i].y != 0)
+            do_hough(laser_points[i].x, laser_points[i].y);
+    }
+
+    std::vector<line_type> lines;
+    for (std::size_t alpha = 0; alpha < 360; alpha++)
+    {
+        for (std::size_t r = 0; r < 401; r++)
+        {
+            int weight = hough_matrix[alpha][r];
+            if (weight > 35)
+                lines.push_back(line_type(alpha, r, weight));
+        }
+    }
+
+    lines = line_cluster(lines);
+    lines = line_cluster(lines);
+
+    std::size_t n_lines = lines.size();
+    for (std::size_t i = 0; i < n_lines; i++)
+        lines[i].r -= 200;
+
+    return lines;
+}
+
+std::vector<line_type> last_believable_result;
+
+double last_x;
+
+double zero_orientation; // 0 degree 方向的 orientation. 见下图.
+
+//            left wall            90 degree            right wall
+//                |                    |                    |
+//                |                    |                    |
+//                |                    |                    |
+//                |                    |                    |
+//                |                    |                    |
+//                |                    |                    |
+//                |                    |                    |
+//                |                    |                    |
+//                |                    |                    |
+// 180 degree --------------------------------------------------- 0 degree
+//                                                                (zero_orientation)
+// 处理 orientation，使其在 [0, 2 pi) 范围内.
+double process_ori(double ori)
+{
+    while (ori < 0)
+        ori += 2 * PI;
+    while (ori >= 2 * PI)
+        ori -= 2 * PI;
+    return ori;
+}
+
+template <typename T> void save_value(const char *file_name_prefix, int file_num, T value)
+{
+    std::ofstream fs(file(file_name_prefix));
+    fs << value;
+}
+
+void save_lidar_data(const short *lidar_data, const char *file_name_prefix, int file_num)
+{
+    std::ofstream ofs(file(file_name_prefix));
+    for (std::size_t i = 0; i < 361; i++)
+        ofs << lidar_data[i] << '\n';
+}
+
+void save_imu_data(imu_data_type imu_data, const char *file_name_prefix, int file_num)
+{
+    std::ofstream ofs(file(file_name_prefix));
+    ofs << imu_data.timestamp << ',' << imu_data.orientation << ',' << imu_data.odometry;
+}
+
+void save_lines(const std::vector<line_type> &lines, const char *file_name_prefix,
+                int file_num)
+{
+    std::fstream fs(file(file_name_prefix), std::ios_base::out);
+    std::size_t n = lines.size();
+
+    for (std::size_t i = 0; i < n; i++)
+        fs << lines[i].theta << ',' << lines[i].r << '\n';
+}
+
+std::vector<line_type> process_1_line(const std::vector<line_type> &lines)
+{
+    std::vector<line_type> ret_lines = lines;
+    int wall_dis = num_distance(last_believable_result[0].r, last_believable_result[1].r);
+    if (ret_lines[0].r < 0)
+        ret_lines.push_back(line_type(ret_lines[0].theta, ret_lines[0].r + wall_dis, 0));
+    else
+        ret_lines.push_back(line_type(ret_lines[0].theta, ret_lines[0].r - wall_dis, 0));
+    return ret_lines;
+}
+
+std::vector<line_type> process_lines(const std::vector<line_type> &lines,
+                                     const short *lidar_data, imu_data_type imu_data)
+{
+    int current_heading =
+        qRound(process_ori(zero_orientation - imu_data.orientation) * scale_factor_2);
+
+    const int line_heading = 360 - current_heading;
+
+    std::vector<line_type> ret_lines;
+    std::size_t n_lines = lines.size();
+    for (std::size_t i = 0; i < n_lines; i++)
+    {
+        if (num_distance(lines[i].theta, line_heading) < 30)
+            ret_lines.push_back(lines[i]);
+    }
+
+    std::size_t n_ret_lines = ret_lines.size();
+
+    if (n_ret_lines == 2 && std::max(ret_lines[0].r, ret_lines[1].r) > 0 &&
+        std::min(ret_lines[0].r, ret_lines[1].r) < 0) // 2 条线位于车两侧.
+    {
+        last_believable_result = ret_lines;
+
+        last_x = -std::min(ret_lines[0].r, ret_lines[1].r);
+
+        qDebug() << "[INFO] `process_lines`: 2 lines found. (" << ret_lines[0].theta
+                 << ',' << ret_lines[0].r << ") (" << ret_lines[1].theta << ','
+                 << ret_lines[1].r << ')';
+        return ret_lines;
+    }
+
+    if (n_ret_lines == 1)
+    {
+        ret_lines = process_1_line(ret_lines);
+        qDebug() << "[WARN] `process_lines`: 1 line found. Try to fix it. ("
+                 << ret_lines[0].theta << ',' << ret_lines[0].r << ") ("
+                 << ret_lines[1].theta << ',' << ret_lines[1].r << ')';
+        last_believable_result = ret_lines;
+        last_x = -std::min(ret_lines[0].r, ret_lines[1].r);
+        return ret_lines;
+    }
+
+    if (n_ret_lines == 0)
+    {
+        qDebug() << "[ERRO] `process_lines`: 0 line found. Data stored. Cannot fix it.";
+        save_lidar_data(lidar_data, "Err points", imu_data.timestamp);
+        ret_lines.clear();
+        return ret_lines;
+    }
+
+    save_lidar_data(lidar_data, "Err points", imu_data.timestamp);
+    save_lines(ret_lines, "Err lines", imu_data.timestamp);
+
+    std::vector<line_type> left_lines;
+    std::vector<line_type> right_lines;
+
+    for (std::size_t i = 0; i < n_ret_lines; i++)
+    {
+        if (ret_lines[i].r < 0)
+            left_lines.push_back(ret_lines[i]);
+        else
+            right_lines.push_back(ret_lines[i]);
+    }
+
+    ret_lines.clear();
+
+    std::size_t n_left_lines = left_lines.size();
+    if (n_left_lines > 0)
+    {
+        int avg_left_theta = 0, avg_left_r = 0;
+        for (std::size_t i = 0; i < n_left_lines; i++)
+        {
+            avg_left_theta += left_lines[i].theta;
+            avg_left_r += left_lines[i].r;
+        }
+        avg_left_theta /= n_left_lines;
+        avg_left_r /= n_left_lines;
+        ret_lines.push_back(line_type(avg_left_theta, avg_left_r, 0));
+    }
+    std::size_t n_right_lines = right_lines.size();
+    if (n_right_lines > 0)
+    {
+        int avg_right_theta = 0, avg_right_r = 0;
+        for (std::size_t i = 0; i < n_right_lines; i++)
+        {
+            avg_right_theta += right_lines[i].theta;
+            avg_right_r += right_lines[i].r;
+        }
+        avg_right_theta /= n_right_lines;
+        avg_right_r /= n_right_lines;
+        ret_lines.push_back(line_type(avg_right_theta, avg_right_r, 0));
+    }
+
+    if (ret_lines.size() == 1)
+        ret_lines = process_1_line(ret_lines);
+    qDebug() << "[ERRO] `process_lines` found wrong lines. Data stored. Try to fix it. ("
+             << ret_lines[0].theta << ',' << ret_lines[0].r << ") (" << ret_lines[1].theta
+             << ',' << ret_lines[1].r << ')';
+    return ret_lines;
+}
+bool init(const short *lidar_data, imu_data_type imu_data)
+{
+    if (!need_init)
+        return true;
+
+    std::vector<line_type> lines = find_lines(lidar_data);
+    if (lines.size() == 2 && num_distance(lines[0].theta, lines[1].theta) < 8 &&
+        std::max(lines[0].r, lines[1].r) > 0 &&
+        std::min(lines[0].r, lines[1].r) < 0) // 2 条线位于车两侧.
+    {
+        double init_orientation = process_ori(imu_data.orientation);
+        int init_heading = 360 - ((lines[0].theta + lines[1].theta) >> 1);
+        zero_orientation = process_ori(init_orientation + init_heading * scale_factor);
+
+        last_believable_result = lines;
+        last_odometry = imu_data.odometry;
+        last_x = -std::min(lines[0].r, lines[1].r);
+
+        qDebug() << "[INFO] `init`: 2 lines found. (" << lines[0].theta << ','
+                 << lines[0].r << ") (" << lines[1].theta << ',' << lines[1].r << ')';
+        need_init = false;
+        return true;
+    }
+
+    qDebug() << "[ERRO] `init`: Cannot find valid lines.";
+    return false;
+}
+
+int judge_heading(const QVector<SensorTimer_Sensor_URG_Data *> &URG_input , int max_point = 30 ){
+
+    double min_dis = 10240;
+    double delta = 0.01;
+
+    for(int i = 0; i <= max_point ; i++){
+        if(URG_input.front()->data[i]< min_dis) min_dis = URG_input.front()->data[i];
+    }
+
+    if(std::abs(URG_input.front()->data[0] - min_dis) < delta) return 1;//0 - 180
+    else if(URG_input.front()->data[0] > min_dis) return 0;// 180 - 360
+    else return -1;// error
+
+}
+
+bool DECOFUNC(setParamsVarsOpenNode)(QString qstrConfigName, QString qstrNodeType, QString qstrNodeClass, QString qstrNodeName, void * paramsPtr, void * varsPtr)
+{
+    XMLDomInterface xmlloader(qstrConfigName,qstrNodeType,qstrNodeClass,qstrNodeName);
+    ProcessorMulti_Processor_Core_Params * params=(ProcessorMulti_Processor_Core_Params *)paramsPtr;
+    ProcessorMulti_Processor_Core_Vars * vars=(ProcessorMulti_Processor_Core_Vars *)varsPtr;
+    /*======Please Program below======*/
+    /*
+    Function: open node.
+    Procedure:
+    1: load parameters (params). [GetParamValue(xmlloader,params,tag); GetEnumParamValue(xmlloader,params,tag); GetUEnumParamValue(xmlloader,params,tag)]
+    2: initialize variables (vars).
+    3: If everything is OK, return 1 for successful opening and vice versa.
+    */
+
+    return 1;
+}
+
+bool DECOFUNC(handleVarsCloseNode)(void * paramsPtr, void * varsPtr)
+{
+    ProcessorMulti_Processor_Core_Params * params=(ProcessorMulti_Processor_Core_Params *)paramsPtr;
+    ProcessorMulti_Processor_Core_Vars * vars=(ProcessorMulti_Processor_Core_Vars *)varsPtr;
+    /*======Please Program below======*/
+    /*
+    Function: close node.
+    Procedure:
+    1: handle/close variables (vars).
+    2: If everything is OK, return 1 for successful closing and vice versa.
+    */
+
+    return 1;
+}
+
+void DECOFUNC(getInternalTrigger)(void * paramsPtr, void * varsPtr, QObject * & internalTrigger, QString & internalTriggerSignal)
+{
+    ProcessorMulti_Processor_Core_Params * params=(ProcessorMulti_Processor_Core_Params *)paramsPtr;
+    ProcessorMulti_Processor_Core_Vars * vars=(ProcessorMulti_Processor_Core_Vars *)varsPtr;
+    internalTrigger=NULL;
+    internalTriggerSignal=QString();
+    /*======Occasionally Program above======*/
+    /*
+    Function: get internal trigger [defined in vars] for node.
+    You need to program here when you need internal trigger (internalTrigger + internalTriggerSignal) for node.
+    E.g.
+    internalTrigger=&(vars->trigger);
+    internalTriggerSignal=QString(SIGNAL(triggerSignal()));
+    */
+}
+
+void DECOFUNC(initializeOutputData)(void * paramsPtr, void * varsPtr, boost::shared_ptr<void> & outputDataPtr)
+{
+    ProcessorMulti_Processor_Core_Params * params=(ProcessorMulti_Processor_Core_Params *)paramsPtr;
+    ProcessorMulti_Processor_Core_Vars * vars=(ProcessorMulti_Processor_Core_Vars *)varsPtr;
+    outputDataPtr=boost::shared_ptr<void>(new SourceDrainMono_Sensor_EncoderIMU_Order_InputData());
+    /*======Occasionally Program below/above======*/
+    /*
+    Function: initial output data.
+    You need to program here when you need to manually initialize output data.
+    */
+
+}
+
+void DECOFUNC(getMultiInputDataSize)(void * paramsPtr, void * varsPtr, QList<int> & inputDataSize)
+{
+    ProcessorMulti_Processor_Core_Params * params=(ProcessorMulti_Processor_Core_Params *)paramsPtr;
+    ProcessorMulti_Processor_Core_Vars * vars=(ProcessorMulti_Processor_Core_Vars *)varsPtr;
+    inputDataSize=QList<int>();
+    /*======Please Program above======*/
+    /*
+    Function: get input data size to be grabbed from buffer.
+    Rules:
+    inputDataSize=0: grab and remove all data from buffer.
+    inputDataSize>0: grab inputDataSize latest data from buffer.
+    inputDataSize<0: grab and remove inputDataSize ancient data from buffer.
+    E.g.
+    inputDataSize=QList<int>()<<0<<1<<-1...;
+    */
+}
+
+// For `init` and `straight`
+
+// init
+
+static int judge(const QVector<SourceDrainMono_Sensor_EncoderIMU_Params *> &IMU_param,
+                 const QVector<SensorTimer_Sensor_URG_Params *> &URG_param,
+                 const QVector<SensorTimer_Sensor_xtion_Params *> &xtion_param,
+
+                 const QVector<SourceDrainMono_Sensor_EncoderIMU_Data *> &IMU_input,
+                 const QVector<SensorTimer_Sensor_URG_Data *> &URG_input,
+                 const QVector<SensorTimer_Sensor_xtion_Data *> &xtion_input)
+{
+
+    //return section;
+    //section = 0 , 10 , 1 ,2 , 3 ,4 ,...
+    int Edge_number = 10;
+    int count = 0;
+    // int Return = -1;
+
+    //std::fstream out("/home/rsys/out.csv", std::ios::out);
+
+    for(int i = 0 ; i< 360 ; i++){
+        if(URG_input.front()->data[i] < 20 && URG_input.front()->data[i]!=0){
+            return 10;
+        }
+    }
+
+    if(if_in_circle) return 5;
+
+    if(if_in_turn) return 4;
+
+    if(Turn_cnt == 4){
+        int cnt = 0;
+        for(int i = 120 ; i<= 240;i++){
+            if(URG_input.front()->data[i]<80) cnt++;
+        }
+
+        if(cnt >= Edge_number) {
+            if_in_circle = 1;
+            return 5;
+        }
+    }
+
+    for(int i = 0;i < 90 ; i++){
+        if(URG_input.front()->data[i] > 300) count ++;
+    }
+
+    if(count >= Edge_number) {
+        return 3;
+    }
+    else count = 0;
+
+    for(int i = 120;i < 240 ; i++){
+        if(URG_input.front()->data[i] > 300) count ++;
+    }
+
+    if(count >= Edge_number) return 1;
+    else count = 0;
+
+    for(int i = 270;i < 360 ; i++){
+        if(URG_input.front()->data[i] > 300) count ++;
+    }
+
+    if(count >= Edge_number) {
+        return 2;
+    }
+    else count = 0;
+
+    //out.close();
+
+    return 0;
+}
+//x,y:car position , line:walls , num : number of walls
+
+output_type straight(const short *lidar_data, imu_data_type imu_data,
+                        bool use_input_error = false, int error = 0)
+{
+    //static int stamp = 0;
+    //static int file_num = 0;
+    static output_type last_output(0, 0);
+    //if (need_init)
+    //    stamp = imu_data.timestamp;
+    const static output_type default_output(0, 100);
+    if (!init(lidar_data, imu_data))
+    {
+        qDebug() << "[ERRO] `go_straight`: `init` returns `false`. Output ( 0 , 100 ) by "
+                    "default.";
+        return default_output;
+    }
+
+    double current_heading_double = process_ori(zero_orientation - imu_data.orientation);
+    double current_odometry = imu_data.odometry;
+
+    last_x += std::cos((last_heading + current_heading_double) * 0.5) *
+              (current_odometry - last_odometry);
+
+    last_heading = process_ori(zero_orientation - imu_data.orientation);
+    last_odometry = current_odometry;
+    std::vector<line_type> lines =
+        process_lines(find_lines(lidar_data), lidar_data, imu_data);
+
+    if (lines.size() == 0)
+    {
+        qDebug() << "[ERRO] `go_straight`: `process_lines` returns 0 lines. Output ("
+                 << (last_output.steer >> 1) << ',' << last_output.speed
+                 << ") by default.";
+        output_type out(last_output.steer >> 1, 100);
+        last_output = out;
+        return out;
+    }
+
+    // 如果 current_heading > 180，表示角度左偏中线.
+    int current_heading = 360 - ((lines[0].theta + lines[1].theta) >> 1);
+
+    // 如果 error < 0，表示在中线左侧.
+    if (!use_input_error)
+        error = -((lines[0].r + lines[1].r) >> 1);
+
+    int expect_heading = 180;
+
+    int correction_item = 90.0 - 90.0 * std::exp(-std::abs(error) * 0.025);
+    if (error < 0)
+        expect_heading -= correction_item;
+    else
+        expect_heading += correction_item;
+
+    qDebug() << "[INFO] `go_straight`: Current heading and error is (" << current_heading
+             << ',' << error << ')';
+    qDebug() << "[INFO] `go_straight`: Expect heading is" << expect_heading;
+
+    // 如果 current_heading > expect_heading，表示角度左偏，需要右转.
+    int output_steer = 10 * (current_heading - expect_heading);
+
+    output_steer = clamp(output_steer, -400, 400);
+
+    const int output_speed = 180;
+
+    qDebug() << "[INFO] `go_straight`: Output (" << output_steer << ',' << output_speed
+             << ')';
+
+    output_type out(output_steer, output_speed);
+    last_output = out;
+
+    qDebug()<<"current_heading:"<<current_heading<<'\n';
+
+    return out;
+}
+
+output_type turn_right(const QVector<SourceDrainMono_Sensor_EncoderIMU_Params *> &IMU_param,
+                                          const QVector<SensorTimer_Sensor_URG_Params *> &URG_param,
+                                          const QVector<SensorTimer_Sensor_xtion_Params *> &xtion_param,
+
+                                          const QVector<SourceDrainMono_Sensor_EncoderIMU_Data *> &IMU_input,
+                                          const QVector<SensorTimer_Sensor_URG_Data *> &URG_input,
+                                          const QVector<SensorTimer_Sensor_xtion_Data *> &xtion_input)
+{
+    if_in_turn = 1;
+    Turn_cnt ++;
+    last_orientation = IMU_input.front()->orientation;
+    output_type output(400,60);
+    return output;
+}
+
+output_type turn_left(const QVector<SourceDrainMono_Sensor_EncoderIMU_Params *> &IMU_param,
+                                          const QVector<SensorTimer_Sensor_URG_Params *> &URG_param,
+                                          const QVector<SensorTimer_Sensor_xtion_Params *> &xtion_param,
+
+                                          const QVector<SourceDrainMono_Sensor_EncoderIMU_Data *> &IMU_input,
+                                          const QVector<SensorTimer_Sensor_URG_Data *> &URG_input,
+                                          const QVector<SensorTimer_Sensor_xtion_Data *> &xtion_input)
+{
+    if_in_turn = 1;
+    Turn_cnt ++;
+    last_orientation = IMU_input.front()->orientation;
+    output_type output(-400,60);
+    return output;
+}
+
+bool judge_turn_off(double last_ori,double ori){
+
+    double delta = 0.01;
+
+    if(std::abs(ori - last_ori - M_PI/2) < delta || std::abs(last_ori - ori - M_PI/2) < delta){
+        return 1;
+    }
+    if(std::abs(ori - last_ori - 3*M_PI/2) < delta || std::abs(last_ori - ori - 3*M_PI/2) < delta){
+        return 1;
+    }
+
+    return 0;
+}
+
+output_type in_turn(const QVector<SourceDrainMono_Sensor_EncoderIMU_Params *> &IMU_param,
+                                          const QVector<SensorTimer_Sensor_URG_Params *> &URG_param,
+                                          const QVector<SensorTimer_Sensor_xtion_Params *> &xtion_param,
+
+                                          const QVector<SourceDrainMono_Sensor_EncoderIMU_Data *> &IMU_input,
+                                          const QVector<SensorTimer_Sensor_URG_Data *> &URG_input,
+                                          const QVector<SensorTimer_Sensor_xtion_Data *> &xtion_input,int last_steer,int last_speed)
+{
+    if(last_orientation < 0) last_orientation = last_orientation + 2*M_PI;
+
+    double now_orientation = IMU_input.front()->orientation;
+
+    if(now_orientation < 0) now_orientation = now_orientation + 2*M_PI;
+
+    qDebug()<<"last_orientation:"<<last_orientation<<"now_orientation:"<<now_orientation<<'\n';
+
+    if(judge_turn_off(last_orientation,now_orientation)) {
+        need_init = true;
+        if_in_turn = 0;
+    }
+
+    output_type output(last_steer,last_speed);
+
+    return output;
+}
+
+output_type circle(const QVector<SourceDrainMono_Sensor_EncoderIMU_Params *> &IMU_param,
+                                      const QVector<SensorTimer_Sensor_URG_Params *> &URG_param,
+                                      const QVector<SensorTimer_Sensor_xtion_Params *> &xtion_param,
+
+                                      const QVector<SourceDrainMono_Sensor_EncoderIMU_Data *> &IMU_input,
+                                      const QVector<SensorTimer_Sensor_URG_Data *> &URG_input,
+                                      const QVector<SensorTimer_Sensor_xtion_Data *> &xtion_input)
+{
+
+    int need_speed = 120;
+
+    double Length = 225;
+
+    double R = URG_input.front()->data[0];
+    double L = URG_input.front()->data[360];
+
+    double Left = L*Length/(R+L);
+
+    int expect_heading = 180;
+    int current_heading = 180;
+
+    int judge_head = judge_heading(URG_input,15);
+
+    int theta = 180*acos(Length/(R+L))/M_PI;
+    double error = 0;
+
+    if(judge_head == 1) current_heading = 180 - 2*theta;
+    else if(judge_head == 0) current_heading = 180 + 2*theta;
+    else qDebug()<<"current_heading:error\n";
+
+    switch (Circle_cnt%2){
+
+    case 0:
+        error = Left - Length/3;
+        break;
+    case 1:
+        error = Left - 2*Length/3;
+        break;
+    default:
+        break;
+
+    }
+
+    //P control
+    int circle_correct = 90.0 - 90.0 * std::exp(-std::abs(error) * 0.025);
+    if (error < 0)
+        expect_heading -= circle_correct;
+    else
+        expect_heading += circle_correct;
+
+    int need_steer = 10 * (current_heading - expect_heading);
+
+    need_steer = clamp(need_steer, -400, 400);
+
+    if(Circle_cnt%2){
+        if(Left == 2*Length/3) Circle_cnt++;
+    }
+    else{
+        if(Left == Length/3) Circle_cnt++;
+    }
+
+    if(Circle_cnt == 4) if_in_circle = 0;
+
+    output_type output(need_steer,need_speed);
+
+    return output;
+}
+
+output_type stop(const QVector<SourceDrainMono_Sensor_EncoderIMU_Params *> &IMU_param,
+                                      const QVector<SensorTimer_Sensor_URG_Params *> &URG_param,
+                                      const QVector<SensorTimer_Sensor_xtion_Params *> &xtion_param,
+
+                                      const QVector<SourceDrainMono_Sensor_EncoderIMU_Data *> &IMU_input,
+                                      const QVector<SensorTimer_Sensor_URG_Data *> &URG_input,
+                                      const QVector<SensorTimer_Sensor_xtion_Data *> &xtion_input)
+{
+    output_type output(0,0);
+
+    return output;
+}
+
+output_type excute(const QVector<SourceDrainMono_Sensor_EncoderIMU_Params *> &IMU_param,
+                                 const QVector<SensorTimer_Sensor_URG_Params *> &URG_param,
+                                 const QVector<SensorTimer_Sensor_xtion_Params *> &xtion_param,
+
+                                 const QVector<SourceDrainMono_Sensor_EncoderIMU_Data *> &IMU_input,
+                                 const QVector<SensorTimer_Sensor_URG_Data *> &URG_input,
+                                 const QVector<SensorTimer_Sensor_xtion_Data *> &xtion_input,
+                                 int input,int last_steer,int last_speed)
+{
+    imu_data_type IMU_data(IMU_input.front()->orientation,IMU_input.front()->odometry,IMU_input.front()->qtimestamp.msecsSinceStartOfDay());
+
+    output_type output(0,0);
+
+    switch (input) {
+    case 0:
+        return stop(IMU_param,URG_param,xtion_param,IMU_input,URG_input,xtion_input);
+        break;
+    case 1:
+        return straight(URG_input.front()->data,IMU_data);
+        break;
+    case 2:
+        return turn_right(IMU_param,URG_param,xtion_param,IMU_input,URG_input,xtion_input);
+        break;
+    case 3:
+        return turn_left(IMU_param,URG_param,xtion_param,IMU_input,URG_input,xtion_input);
+        break;
+    case 4:
+        return in_turn(IMU_param,URG_param,xtion_param,IMU_input,URG_input,xtion_input,last_steer,last_speed);
+        break;
+    case 5:
+        return circle(IMU_param,URG_param,xtion_param,IMU_input,URG_input,xtion_input);
+        break;
+    case 10:
+        return stop(IMU_param,URG_param,xtion_param,IMU_input,URG_input,xtion_input);
+        break;
+    default:
+        qDebug()<<"Excuting error\n";
+        return output;
+        break;
+    }
+}
+
+//Input Port #0: Buffer_Size = 10, Params_Type = SourceDrainMono_Sensor_EncoderIMU_Params, Data_Type = SourceDrainMono_Sensor_EncoderIMU_Data
+//Input Port #1: Buffer_Size = 10, Params_Type = SensorTimer_Sensor_URG_Params, Data_Type = SensorTimer_Sensor_URG_Data
+//Input Port #2: Buffer_Size = 10, Params_Type = SensorTimer_Sensor_xtion_Params, Data_Type = SensorTimer_Sensor_xtion_Data
+bool DECOFUNC(processMultiInputData)(void *paramsPtr, void *varsPtr, QVector<QVector<void *> > inputParams, QVector<QVector<void *> > inputData, void *outputData, QList<int> &outputPortIndex)
+{
+    ProcessorMulti_Processor_Core_Params *params=(ProcessorMulti_Processor_Core_Params *)paramsPtr;
+    ProcessorMulti_Processor_Core_Vars *vars=(ProcessorMulti_Processor_Core_Vars *)varsPtr;
+    QVector<SourceDrainMono_Sensor_EncoderIMU_Params *> inputparams_0; copyQVector(inputparams_0,inputParams[0]);
+    QVector<SensorTimer_Sensor_URG_Params *> inputparams_1; copyQVector(inputparams_1,inputParams[1]);
+    QVector<SensorTimer_Sensor_xtion_Params *> inputparams_2; copyQVector(inputparams_2,inputParams[2]);
+    QVector<SourceDrainMono_Sensor_EncoderIMU_Data *> inputdata_0; copyQVector(inputdata_0,inputData[0]);
+    QVector<SensorTimer_Sensor_URG_Data *> inputdata_1; copyQVector(inputdata_1,inputData[1]);
+    QVector<SensorTimer_Sensor_xtion_Data *> inputdata_2; copyQVector(inputdata_2,inputData[2]);
+    SourceDrainMono_Sensor_EncoderIMU_Order_InputData *outputdata=(SourceDrainMono_Sensor_EncoderIMU_Order_InputData *)outputData;
+    outputPortIndex=QList<int>();
+    if(inputdata_0.size()==0){return 0;}
+    if(inputdata_1.size()==0){return 0;}
+    if(inputdata_2.size()==0){return 0;}
+    /*======Please Program below======*/
+    /*
+    Step 1: process inputdata_index, then store it into outputdata.
+    Step 2 [optional]: determine the outputPortIndex. (if not, outputdata will be sent by all ports)
+    E.g. outputPortIndex=QList<int>()<<(outportindex1)<<(outportindex2)...
+    */
+
+    //inputdata_0                                             // EncoderIMU
+    //inputdata_1                                             // URG
+    //inputdata_2                                             // Xtion (RGB && depth)
+    //cv::imshow("color", inputdata_2.front()->cvColorImg);   // Show RGB image
+    //cv::imshow("depth", inputdata_2.front()->cvDepthImg);   // Show depth image
+
+    short steer = 110;           // [-400, 400]
+    short speed = 100;           // [-180, 180]
+
+    output_type output_data(0,0);
+    int input = judge(inputparams_0, inputparams_1, inputparams_2, inputdata_0, inputdata_1, inputdata_2);
+    output_data = excute(inputparams_0, inputparams_1, inputparams_2, inputdata_0, inputdata_1, inputdata_2,input,last_steer,last_speed);
+    steer = output_data.steer;
+    speed = output_data.speed;
+
+    qDebug() <<"input:"<< input <<'\n' ;
+
+    qDebug()<<"orientation"<<inputdata_0.front()->orientation<<'\n';
+
+    qDebug() <<"steer:"<< steer <<"speed:"<< speed << '\n';
+
+    // Show RGB image && compass
+    double ori = - ((double)steer / 400.0) * (M_PI / 2.0);
+    cv::Mat img;
+    inputdata_2.front()->cvColorImg.copyTo(img);
+    cv::flip(img, img, 1);
+    cv::Point compass = cv::Point(100, 100);
+    cv::circle(img, compass, 80, cv::Scalar(0,255,0), 1, CV_AA);
+    cv::line(img, compass,
+             cv::Point(compass.x - sin(ori) * 80,
+                       compass.y - cos(ori) * 80),
+             cv::Scalar(0,255,0), 3, CV_AA);
+    cv::imshow("color", img);
+    //--------------------------------------------
+    int maxSpeed = 180;
+    if (speed > maxSpeed) speed = maxSpeed;
+    if (speed < -maxSpeed) speed = -maxSpeed;
+    char dataput[20];
+    dataput[0] = 0xF8;
+    dataput[1] = 4;
+    *(short*)&dataput[2] = (short)steer;
+    *(short*)&dataput[4] = (short)speed;
+
+    last_steer = steer;
+    last_speed = speed;
+
+    dataput[6] = 0x8F;
+    outputdata->datagram = QByteArray(dataput, 7);
+    return 1;
+}
