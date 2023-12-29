@@ -719,7 +719,7 @@ bool Detect_Car(const short *lidar_data){
 
 // *寻找突变*
 std::pair<int,int> Find_Mutation(const short *arr,int len){ //len = 361
-    double Mutation[len - 1];
+    double Mutation[360];
     for(int i = 0 ; i < len ; i++){
         Mutation[i] = arr[i + 1] - arr[i];
     }
@@ -833,6 +833,8 @@ output_type turn_to_find(const short *lidar_data, imu_data_type imu_data){
     }
 
     if(counter >= 20) return turn_left_func(imu_data);
+
+    return go_straight(lidar_data,imu_data);
 }
 /***********************/
 
