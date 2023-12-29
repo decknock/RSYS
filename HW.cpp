@@ -706,7 +706,7 @@ bool Detect_Car(const short *lidar_data){
 
     int cnt = 0;
     int threshold_detect = 20;
-    int min_length = 100;
+    int min_length = 200;
 
     for(int i = 60 ; i <= 240 ; i++){
         if(lidar_data[i] < min_length && lidar_data[i] != 0) cnt++;
@@ -739,6 +739,12 @@ std::pair<int,int> Find_Mutation(const short *arr,int len){ //len = 361
             end = i;
             Max = Mutation[i];
         }
+    }
+
+    bool IF_PRINT = false;
+    if(IF_PRINT){
+        qDebug()<<"First Mutation : "<<"1. "<<arr[start]<<"2. "<<arr[start+1]<<"3. "<<arr[start + 2];
+        qDebug()<<"Second Mutation : "<<"1. "<<arr[end - 1]<<"2. "<<arr[end]<<"3. "<<arr[end + 1];
     }
 
     return std::pair<int,int>(start + 1,end);
@@ -780,8 +786,9 @@ std::pair<bool,double> Detect_Rascal(const short *lidar_data){
     else if(result.first + angle/2 > big) mode = 1;//error > 0
     else mode = 0;
 
+    qDebug()<<"Car Mode: "<<mode;
     //更新Record
-    int Capacity = 20;//Record记录最近Capacity时间段内 mode情况
+    // int Capacity = 20;//Record记录最近Capacity时间段内 mode情况
 
     if(mode == 0){
         //在误差范围内的“正后方”
@@ -789,6 +796,7 @@ std::pair<bool,double> Detect_Rascal(const short *lidar_data){
     }
     else if(mode == -1 || mode == 1){
         double error = middle*cos(result.first + angle/2);
+        qDebug()<<"Input Error: "<<error;
         return std::pair<bool,double>(true,error);
     }
 
@@ -798,7 +806,6 @@ std::pair<bool,double> Detect_Rascal(const short *lidar_data){
 
 // *转弯找小车*
 output_type turn_to_find(const short *lidar_data, imu_data_type imu_data){
-    int counter = 0;
     
     bool front_barrier = false;
     int counter = 0;
@@ -823,7 +830,11 @@ output_type turn_to_find(const short *lidar_data, imu_data_type imu_data){
             counter++;
     }
 
-    if(counter >= 20) return turn_right_func(imu_data);
+    if(counter >= 20){
+        qDebug()<<"Turn Right";
+
+        return turn_right_func(imu_data);
+    } 
 
     counter = 0;
     for (std::size_t i = 330; i <= 360; i++)
@@ -832,7 +843,13 @@ output_type turn_to_find(const short *lidar_data, imu_data_type imu_data){
             counter++;
     }
 
-    if(counter >= 20) return turn_left_func(imu_data);
+    if(counter >= 20){
+        qDebug()<<"Turn Left";
+
+        return turn_left_func(imu_data);
+    } 
+
+    qDebug()<<"Go Straight";
 
     return go_straight(lidar_data,imu_data);
 }
@@ -877,6 +894,9 @@ output_type selector_1(const short *lidar_data, imu_data_type imu_data)
     global_file_num++;
     
     can_find_car = Detect_Car(lidar_data);//寻找小车
+
+    qDebug()<<"Whether Find Car: "<<can_find_car;
+
     if(can_find_car){
         std::pair<bool,double> p = Detect_Rascal(lidar_data);
         return go_straight(lidar_data, imu_data,p.first,p.second);
