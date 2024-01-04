@@ -732,7 +732,7 @@ output_type selector(const short *lidar_data, imu_data_type imu_data)
     return go_straight(lidar_data, imu_data);
 }
 
-//期末部分
+//期末摆烂部分
 
 bool IsCar = false;//是否检测到小车的全局变量
 double threshold_distance1 = 500;
