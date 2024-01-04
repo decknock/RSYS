@@ -17,8 +17,6 @@ const double scale_factor_2 = 360.0 / PI;
 int exp_times = 0;
 int global_file_num = 1;
 
-bool can_find_car = false;
-
 #define user_path "/home/mini/Desktop/Data/%1"
 #define exp_times_path "" // QString(user_path).arg("exp_times.txt").toStdString().c_str()
 #define file(file_name)                                                                  \
@@ -427,7 +425,9 @@ const int turn_speed = 100;
 
 output_type go_straight(const short *lidar_data, imu_data_type imu_data,
                         bool use_dis_to_left_arg = false, int dis_to_left_arg = 0,
-                        bool use_dis_to_right_arg = false, int dis_to_right_arg = 0)
+                        bool use_dis_to_right_arg = false, int dis_to_right_arg = 0,
+                        bool use_error = false,double Error = 0,
+                        bool use_speed = false,int input_speed = 0)
 {
     static output_type last_output(0, 0);
     const output_type default_output(0, 150);
@@ -474,6 +474,10 @@ output_type go_straight(const short *lidar_data, imu_data_type imu_data,
 
     double expect_heading = 180.0;
 
+    if(use_error){ // 直接使用已经算好的error
+        error = Error;
+    }
+
     double correction_item = process_error(error);
     if (error < 0)
         expect_heading -= correction_item;
@@ -490,8 +494,12 @@ output_type go_straight(const short *lidar_data, imu_data_type imu_data,
 
     qDebug() << "[INFO] `go_straight`: Output (" << output_steer << ',' << straight_speed
              << ')';
+    
+    int output_speed = 0;
+    if(use_speed) output_speed = input_speed;
+    else output_speed = straight_speed;
 
-    output_type out(output_steer, straight_speed);
+    output_type out(output_steer, output_speed);
     last_output = out;
     return out;
 }
@@ -700,161 +708,6 @@ output_type circle(const short *lidar_data, imu_data_type imu_data)
     return out;
 }
 
-/***********************/
-// *检测小车*
-bool Detect_Car(const short *lidar_data){
-
-    int cnt = 0;
-    int threshold_detect = 20;
-    int min_length = 200;
-
-    for(int i = 60 ; i <= 240 ; i++){
-        if(lidar_data[i] < min_length && lidar_data[i] != 0) cnt++;
-    }
-
-    if(cnt >= threshold_detect) return true;
-    else return false;
-
-}
-
-// *寻找突变*
-std::pair<int,int> Find_Mutation(const short *arr,int len){ //len = 361
-    double Mutation[360];
-    for(int i = 0 ; i < len ; i++){
-        Mutation[i] = arr[i + 1] - arr[i];
-    }
-
-    double Max = -100000.0;
-    double Min = 100000.0;
-
-    int start = 0; 
-    int end = 0;
-
-    for(int i = 0 ; i < len ; i++){
-        if(Mutation[i] < Min){
-            start = i;
-            Min = Mutation[i];
-        }
-        if(Mutation[i] > Max){
-            end = i;
-            Max = Mutation[i];
-        }
-    }
-
-    bool IF_PRINT = false;
-    if(IF_PRINT){
-        qDebug()<<"First Mutation : "<<"1. "<<arr[start]<<"2. "<<arr[start+1]<<"3. "<<arr[start + 2];
-        qDebug()<<"Second Mutation : "<<"1. "<<arr[end - 1]<<"2. "<<arr[end]<<"3. "<<arr[end + 1];
-    }
-
-    return std::pair<int,int>(start + 1,end);
-}
-
-// *直行修正*
-std::pair<bool,double> Detect_Rascal(const short *lidar_data){
-    // 激光雷达：URG_input.front()->data
-    double threshold = 150.0;
-
-    std::pair<int,int> result = Find_Mutation(lidar_data,361);
-    double angle = (result.second - result.first)*M_PI/360.0; 
-    //(result.second - result.first)/2是角度，还要转化为弧度
-    int start = lidar_data[result.first];
-    int end = lidar_data[result.second];
-    
-    // 没有障碍物或者障碍物太远(没有障碍物，返回值会在90度左右的地方)
-    if(start > threshold || end > threshold) return std::pair<bool,double>(false,0.0);
-
-    double PaperBoardLength = 0.0;
-    //余弦定理计算纸板长度
-    PaperBoardLength = std::sqrt(start*start + end*end + 2*start*end*std::cos(angle));
-
-    double angle1 = 0.0; // end与纸板的夹角
-    double angle2 = 0.0; // start与纸板的夹角
-    //余弦定理计算角度
-    angle1 = std::acos((end*end + PaperBoardLength*PaperBoardLength - start*start)/(2*end*PaperBoardLength));
-    angle2 = std::acos((start*start + PaperBoardLength*PaperBoardLength - end*end)/(2*start*PaperBoardLength));
-    //计算激光雷达到纸板中点的距离
-    double middle = 0.0;
-    middle = std::sqrt(start*start + PaperBoardLength*PaperBoardLength*0.25 - start*PaperBoardLength*std::cos(angle2));
-
-    //判断小车偏前方小车左还是右
-    int mode = 0;
-    double small = 80*M_PI/180;
-    double big = 100*M_PI/180;
-    //用angle/2来近似start与middle的夹角,因为纸板较窄
-    if(result.first + angle/2 < small) mode = -1;//表示小车在目标小车左边,error < 0
-    else if(result.first + angle/2 > big) mode = 1;//error > 0
-    else mode = 0;
-
-    qDebug()<<"Car Mode: "<<mode;
-    //更新Record
-    // int Capacity = 20;//Record记录最近Capacity时间段内 mode情况
-
-    if(mode == 0){
-        //在误差范围内的“正后方”
-        return std::pair<bool,double>(false,0.0);
-    }
-    else if(mode == -1 || mode == 1){
-        double error = middle*cos(result.first + angle/2);
-        qDebug()<<"Input Error: "<<error;
-        return std::pair<bool,double>(true,error);
-    }
-
-    //若发生mode不为上述值的情况(虽然一般不会发生)
-    return std::pair<bool,double>(false,0.0);
-}
-
-// *转弯找小车*
-output_type turn_to_find(const short *lidar_data, imu_data_type imu_data){
-    
-    bool front_barrier = false;
-    int counter = 0;
-
-    for (std::size_t i = 150; i <= 210; i++)
-    {
-        if (lidar_data[i] > 0 && lidar_data[i] < 220)
-            counter++;
-    }
-
-    if (counter > 50)
-        front_barrier = true;
-
-    int threshold = 600;
-
-    if (front_barrier)
-        threshold = 300;
-
-    for (std::size_t i = 0; i < 30; i++)
-    {
-        if (lidar_data[i] == 0 || lidar_data[i] > threshold)
-            counter++;
-    }
-
-    if(counter >= 20){
-        qDebug()<<"Turn Right";
-
-        return turn_right_func(imu_data);
-    } 
-
-    counter = 0;
-    for (std::size_t i = 330; i <= 360; i++)
-    {
-        if (lidar_data[i] == 0 || lidar_data[i] > threshold)
-            counter++;
-    }
-
-    if(counter >= 20){
-        qDebug()<<"Turn Left";
-
-        return turn_left_func(imu_data);
-    } 
-
-    qDebug()<<"Go Straight";
-
-    return go_straight(lidar_data,imu_data);
-}
-/***********************/
-
 output_type selector(const short *lidar_data, imu_data_type imu_data)
 {
     static bool is_init = false;
@@ -879,8 +732,191 @@ output_type selector(const short *lidar_data, imu_data_type imu_data)
     return go_straight(lidar_data, imu_data);
 }
 
-output_type selector_1(const short *lidar_data, imu_data_type imu_data)
-{
+//期末部分
+
+bool IsCar = false;//是否检测到小车的全局变量
+double threshold_distance1 = 500;
+double threshold_distance2 = 100;
+int error_cnt = 0;
+int max_error_cnt = 5;
+
+// *检测小车*
+bool Detect_The_Car(const short *lidar_data){
+    //检测激光雷达突变
+
+    int start_detect = 70;
+    int end_detetct = 290;
+
+    int threshold = 250;
+    int cnt = 0;
+
+    for(int i = start_detect;i <= end_detetct;i++){
+        if(int(lidar_data[i+1] - lidar_data[i]) > threshold || int(lidar_data[i] - lidar_data[i+1]) > threshold) cnt ++;
+    }
+    qDebug()<<"Mutation Times : "<<cnt;
+
+    if(cnt >= 2){
+        // *cnt > 2*一般不会出现
+        qDebug()<<"Detect The Car";
+        return true;
+    }
+
+    else if(cnt == 1){
+        qDebug()<<"Detect The Wall";
+        return false;
+    }
+
+    qDebug()<<"Detect Nothing";
+    return false;
+}
+
+//*查找小车所在的突变*
+std::pair<int,int> Find_Mutation(const short *lidar_data){
+    if(!IsCar){
+        qDebug()<<"There Is No Car";
+        return std::pair<int,int>(-1,-1);
+    }
+
+    int Mutation[360];
+    for(int i = 0;i < 360; i++){
+        Mutation[i] = lidar_data[i+1] - lidar_data[i];
+    }
+
+    int Max_Distance = -100000;
+    int Min_Distance = 100000;
+    int start,end;//start : 小车纸板右边界对应的度数
+
+    for(int i = 0 ; i < 360 ; i++){
+        if(Mutation[i] < Min_Distance){
+            start = i + 1;
+            Min_Distance = Mutation[i];
+        }
+        if(Mutation[i] > Max_Distance){
+            end = i;
+            Max_Distance = Mutation[i];
+        }
+    }
+
+    bool IF_PRINT = true;
+    if(IF_PRINT){
+        qDebug()<<"First Mutation : "<<"1. "<<lidar_data[start - 1]<<"2. "<<lidar_data[start]<<"3. "<<lidar_data[start + 1];
+        qDebug()<<"Second Mutation : "<<"1. "<<lidar_data[end - 1]<<"2. "<<lidar_data[end]<<"3. "<<lidar_data[end + 1];
+    }
+
+    return std::pair<int,int>(start,end);
+}
+
+//*计算error*
+std::pair<double,double> Detect_Rascal(const short *lidar_data){
+    //(error,distance)
+    double MiniLength = 5.0;
+    double MaxLength = 40.0;
+
+    std::pair<int,int> result = Find_Mutation(lidar_data);
+    //计算夹角
+    double angle = (result.second - result.first)*M_PI/360.0;  
+    //计算激光雷达到纸板两端的距离
+    int start = lidar_data[result.first];
+    int end = lidar_data[result.second];
+    //余弦定理计算纸板长度
+    double PaperBoardLength = 0.0;
+    PaperBoardLength = std::sqrt(start*start + end*end + 2*start*end*std::cos(angle));
+    //在保证小车纸板有足够长度的前提下，这意味着前面检测小车的函数出现了失误
+    if(PaperBoardLength < MiniLength || PaperBoardLength > MaxLength){
+        qDebug()<<"PaperBoardLength : "<<PaperBoardLength<<" Too small or Too long , Maybe Something Wrong";
+        return std::pair<double,double>(0.0,-1);
+    }
+
+    double angle1 = 0.0; // start与纸板的夹角
+    angle1 = std::acos((start*start + PaperBoardLength*PaperBoardLength - end*end)/(2*start*PaperBoardLength));
+    //计算激光雷达到纸板中点的距离
+    double middle = 0.0;
+    middle = std::sqrt(start*start + PaperBoardLength*PaperBoardLength*0.25 - start*PaperBoardLength*std::cos(angle1));
+
+    if(middle > threshold_distance1){
+        qDebug()<<"distance to the car too long";
+        return std::pair<double,double>(0.0,middle);
+    }
+    else if(middle < threshold_distance2){
+        qDebug()<<"distance too short";
+        return std::pair<double,double>(0.0,middle);
+    }
+    else{
+        double error = middle*cos(result.first + angle/2);
+        qDebug()<<"Caculate error: "<<error;
+        return std::pair<double,double>(error,middle);
+    }
+
+    //以防没有返回值
+    return std::pair<double,double>(0.0,0.0);
+}
+
+//*寻找小车*
+output_type Find_Car(const short *lidar_data,imu_data_type imu_data){
+    qDebug()<<"Find Car ";
+    //为转弯作准备
+    bool front_barrier = false;
+    int counter = 0;
+    for (int i = 150; i <= 210; i++){
+        if (lidar_data[i] > 0 && lidar_data[i] < 220) counter++;
+    }
+    if (counter > 50 ) front_barrier = true;
+    int threshold = 600;
+    if (front_barrier) threshold = 300;
+
+    counter = 0;
+    //优先向一个方向转弯
+    for (int i = 0; i < 30; i++){
+        if (lidar_data[i] == 0 || lidar_data[i] > threshold) counter++;
+    }
+    if(counter >= 20){
+        qDebug()<<"Turn Right";
+        return turn_right_func(imu_data);
+    } 
+
+    counter = 0;
+    for (int i = 360; i >= 330; i--){
+        if (lidar_data[i] == 0 || lidar_data[i] > threshold) counter++;
+    }
+    if(counter >= 20){
+        qDebug()<<"Turn Left";
+        return turn_left_func(imu_data);
+    } 
+
+    //既不左转也不右转
+    return go_straight(lidar_data,imu_data);
+}
+
+//*跟随小车*
+output_type Follow_Car(const short *lidar_data,imu_data_type imu_data){
+    qDebug()<<"Follow Car ";
+
+    if(error_cnt == max_error_cnt){//发现纸板长度异常多次，可能把墙的凸起识别为了小车
+        qDebug()<<"Confirm Detect Wrong thing , not the car";
+        error_cnt = 0;
+        return Find_Car(lidar_data,imu_data);
+    }
+
+    std::pair<double,double> result = Detect_Rascal(lidar_data);
+    if(result.second < 0){//正常直行
+        error_cnt ++;
+        return go_straight(lidar_data,imu_data);
+    }
+    else if(result.second > threshold_distance1){
+        return go_straight(lidar_data,imu_data);
+    }
+    else if(result.second < threshold_distance2){
+        //距离过近，暂时减速或者停车
+        int input_speed = 0;
+        return go_straight(lidar_data,imu_data,false,0,false,0,false,0,true,input_speed);
+    }
+    else{
+        return go_straight(lidar_data,imu_data,false,0,false,0,true,result.first);
+    }
+}
+
+// *行为选择*
+output_type selector_1(const short *lidar_data, imu_data_type imu_data){
     static bool is_init = false;
     static int start_stamp = 0;
     if (!is_init)
@@ -888,20 +924,14 @@ output_type selector_1(const short *lidar_data, imu_data_type imu_data)
         start_stamp = imu_data.timestamp - 1;
         is_init = true;
     }
-    qDebug() << "\n[INFO] `selector`: timestamp:" << imu_data.timestamp - start_stamp;
-    save_lidar_data(lidar_data, "LiDAR_Data", global_file_num);
-    save_imu_data(imu_data, "IMU_Data", global_file_num);
-    global_file_num++;
-    
-    can_find_car = Detect_Car(lidar_data);//寻找小车
+    qDebug() << "\n[INFO] `selector_1`: timestamp:" << imu_data.timestamp - start_stamp;
 
-    qDebug()<<"Whether Find Car: "<<can_find_car;
+    IsCar = Detect_The_Car(lidar_data);
 
-    if(can_find_car){
-        std::pair<bool,double> p = Detect_Rascal(lidar_data);
-        return go_straight(lidar_data, imu_data,p.first,p.second);
+    if(IsCar){
+        return Follow_Car(lidar_data,imu_data);
     }
     else{
-        return turn_to_find(lidar_data, imu_data);
+        return Find_Car(lidar_data,imu_data);
     }
 }
